@@ -11,4 +11,4 @@ The attack works by optimizing a random noise so it produces the same gradient a
 
 ## iDGL
 
-Improved Deep Gradient Leakage is an improvement of the DGL which uses statistical knowledge about the derivative of the cross entropy in order to properly extract the label and thus improve the stability of the attack. More information in [iDLG: Improved Deep Leakage from Gradients](https://arxiv.org/abs/2001.02610).
+Improved Deep Gradient Leakage is an improvement of the DGL which uses analytical knowledge about the derivative of the cross entropy in order to properly extract the label and thus improve the stability of the attack. More information in [iDLG: Improved Deep Leakage from Gradients](https://arxiv.org/abs/2001.02610).
