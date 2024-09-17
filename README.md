@@ -8,3 +8,7 @@ Implementation of the Deep Gradient Leakage privacy attack for federated learnin
 </p>
 
 The attack works by optimizing a random noise so it produces the same gradient as the gradient leaked. This leads to the noise being close to the original data in many cases.
+
+## iDGL
+
+Improved Deep Gradient Leakage is an improvement of the DGL which uses statistical knowledge about the derivative of the cross entropy in order to properly extract the label and thus improve the stability of the attack. More information in [iDLG: Improved Deep Leakage from Gradients](https://arxiv.org/abs/2001.02610).
