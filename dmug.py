@@ -15,18 +15,12 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 
-from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from torchvision.datasets import FashionMNIST
 
-CLIENTS_PER_ROUND = 10
 EPOCHS = 5
-N_ROUNDS = 3
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
-DIR = f"{os.path.dirname(__file__)}/metrics"
-writer = SummaryWriter(f"{DIR}/dgl")
 
 figures = []
 
@@ -42,7 +36,7 @@ def get_dataset():
     config.n_nodes = 2
     config.labels_per_node = [
         [0, 1],
-        [1, 2]
+        [2, 3]
     ]
 
     flex_dataset = FedDataDistribution.from_config(flex_dataset, config)
@@ -61,9 +55,9 @@ def get_dataset():
     flex_dataset["server"] = test_data
 
     return flex_dataset
-# Make images go from -1 to 1
+
 mnist_transforms = transforms.Compose(
-    [transforms.ToTensor(), transforms.Lambda(lambda x: 2 * x - 1)]
+    [transforms.ToTensor()]
 )
 
 
@@ -110,7 +104,7 @@ class Generator(nn.Module):
             nn.BatchNorm2d(64, 0.8),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(64, output_dim, 3, stride=1, padding=1),
-            nn.Tanh(),
+            nn.Sigmoid(),
         )
 
     def forward(self, z):
@@ -134,6 +128,7 @@ def copy_server_model_to_clients(server_flex_model: FlexModel):
     new_flex_model = FlexModel()
     new_flex_model["model"] = copy.deepcopy(server_flex_model["model"])
     new_flex_model["server_model"] = copy.deepcopy(server_flex_model["model"])
+    new_flex_model["discriminator"] = copy.deepcopy(server_flex_model["model"])
     new_flex_model["criterion"] = copy.deepcopy(server_flex_model["criterion"])
     new_flex_model["optimizer_func"] = copy.deepcopy(server_flex_model["optimizer_func"])
     new_flex_model["optimizer_kwargs"] = copy.deepcopy(server_flex_model["optimizer_kwargs"])
@@ -151,7 +146,7 @@ def train(client_flex_model: FlexModel, client_data: Dataset):
         torch_dataset, batch_size=128, shuffle=True, pin_memory=False
     )
 
-    for _ in range(EPOCHS):
+    for _ in range(EPOCHS + 6):
         running_loss = 0.0
         for inputs, labels in dataloader:
             inputs, labels = inputs.to(device), labels.to(device)
@@ -187,46 +182,6 @@ def train_benign(pool: FlexPool):
     pool.servers.map(copy_server_model_to_clients, benign_client)
     losses = benign_client.map(train)
     print(f"Benign client loss: {losses}")
-    pool.servers.map(get_clients_weights, benign_client)
-    pool.servers.map(fed_avg)
-    pool.servers.map(set_agreggated_weights_to_server, pool.servers)
-
-def optimize_generator(flex_model: FlexModel, _, label: int = 0):
-    if "generator" not in flex_model:
-        flex_model["generator"] = Generator()
-    model = flex_model["model"].to(device)
-    generator = flex_model["generator"].to(device)
-    criterion = flex_model["criterion"]
-    
-    optimizer = torch.optim.Adam(generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
-    
-    fixed_label = torch.full((128,), label, dtype=torch.long, device=device)
-    
-    generator.train()
-    model.train()
-    for epoch in range(EPOCHS):
-        for _ in range(10):  # Number of steps per epoch
-            noise = torch.randn(128, 100, device=device)
-            fake_images = generator(noise)
-            
-            outputs = model(fake_images)
-            
-            loss = criterion(outputs, fixed_label)
-            
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-        
-        print(f"Epoch [{epoch+1}/{EPOCHS}], Loss: {loss.item()}")
-        random_image = fake_images[0].detach().cpu().numpy()
-        if len(random_image.shape) == 3:
-            random_image = random_image.squeeze()
-    
-    print("Finished optimizing the generator")
-    # return random images
-    noise = torch.randn(7000, 100, device=device)
-    fake_images = generator(noise)
-    return fake_images
 
 # Work around for being able to concat with a TensorDataset
 # since labels must be the same type
@@ -242,13 +197,55 @@ class TensorLabelDataset(torch.utils.data.Dataset):
         label = torch.tensor(label, dtype=torch.long)
         return data, label
 
-def train_with_fake_images(client_flex_model: FlexModel, client_data: Dataset, fake_images: torch.Tensor):
+def merge_dataset(client_data: Dataset, fake_images: torch.Tensor, fake_labels: torch.Tensor):
     dataset = TensorLabelDataset(client_data.to_torchvision_dataset(transform=mnist_transforms))
     # Insert the fake images into the dataset
     fake_images = fake_images.detach().cpu()
-    fake_labels = torch.full((7000,), 10, dtype=torch.long, device="cpu")
     fake_dataset = torch.utils.data.TensorDataset(fake_images, fake_labels)
     train_dataset = torch.utils.data.ConcatDataset([dataset, fake_dataset])
+    return train_dataset
+
+def optimize_gan(flex_model: FlexModel, client_data: Dataset, label: int = 0):
+    if "generator" not in flex_model:
+        flex_model["generator"] = Generator()
+    discriminator = flex_model["discriminator"].to(device)
+    generator = flex_model["generator"].to(device)
+    criterion = flex_model["criterion"]
+    dataloader = DataLoader(client_data.to_torchvision_dataset(transform=mnist_transforms), batch_size=128, shuffle=True, pin_memory=False)
+    
+    generator_optimizer = torch.optim.Adam(generator.parameters(), lr=0.0002, betas=(0.5, 0.999), weight_decay=1e-4)
+    discriminator_optimizer = torch.optim.Adam(discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
+    
+    generator.train()
+    discriminator.train()
+    
+    for inputs, labels in dataloader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        generator_optimizer.zero_grad()
+        discriminator_optimizer.zero_grad()
+        outputs = discriminator(inputs)
+        loss_real = criterion(outputs, labels)
+
+        fake_images = generator(torch.randn(128, 100, device=device))
+        fake_labels = torch.full((128,), label, dtype=torch.long, device=device)
+        true_labels = torch.full((128,), 10, dtype=torch.long, device=device)
+        fake_outputs = discriminator(fake_images)
+        generator_loss = criterion(fake_outputs, fake_labels)
+        dis_fake_loss = criterion(fake_outputs, true_labels)
+        discriminator_loss = loss_real + dis_fake_loss
+        discriminator_loss.backward(retain_graph=True)
+        generator_loss.backward()
+        
+        discriminator_optimizer.step()
+        generator_optimizer.step()
+    
+    return generator_loss, discriminator_loss
+
+def train_with_fake_images(client_flex_model: FlexModel, client_data: Dataset):
+    size = len(client_data)
+    fake_images = client_flex_model["generator"].to(device)(torch.randn(size, 100, device=device))
+    fake_labels = torch.full((size,), 4, dtype=torch.long, device="cpu")
+    train_dataset = merge_dataset(client_data, fake_images, fake_labels)
 
     dataloader = DataLoader(train_dataset, batch_size=128, shuffle=True, pin_memory=False)
     model = client_flex_model["model"]
@@ -256,7 +253,7 @@ def train_with_fake_images(client_flex_model: FlexModel, client_data: Dataset, f
     model.train()
     model = model.to(device)
     optimizer = client_flex_model["optimizer_func"](model.parameters(), **client_flex_model["optimizer_kwargs"])
-    for _ in range(EPOCHS):
+    for _ in range(EPOCHS + 6):
         running_loss = 0.0
         for inputs, labels in dataloader:
             inputs, labels = inputs.to(device), labels.to(device)
@@ -273,33 +270,34 @@ def train_with_fake_images(client_flex_model: FlexModel, client_data: Dataset, f
 def train_malicious(pool: FlexPool):
     malicious_client = pool.select(lambda id, role: id == 1)
     pool.servers.map(copy_server_model_to_clients, malicious_client)
-    fake_images = malicious_client.map(optimize_generator, label=0)[0]
-    malicious_client.map(train_with_fake_images, fake_images=fake_images)
-    pool.servers.map(get_clients_weights, malicious_client)
-    pool.servers.map(fed_avg)
-    pool.servers.map(set_agreggated_weights_to_server, pool.servers)
+    for i in range(16):
+        gen_loss, dis_loss = malicious_client.map(optimize_gan, label=0)[0]
+        print(f"[EPOCH {i+1}/10] Generator loss: {gen_loss}, Discriminator loss: {dis_loss}")
+    malicious_client.map(train_with_fake_images)
     
 def extract_fake_image(pool: FlexPool, i:int):
     malicious_client = pool.select(lambda id, role: id == 1)
     noise = torch.randn(64, 100, device=device)
     fake_image = malicious_client.map(lambda flex_model, _: flex_model["generator"].to(device)(noise))[0]
     fake_image = fake_image[0].detach().cpu().numpy()
+    # make sure image is between 0 and 1, if not, normalize
     plt.imsave(f"fake_image_{i}.png", fake_image.squeeze(), cmap="gray")
     print("Fake image saved")
     
 
 def run_attack(pool: FlexPool):
+    # Warmup
+    train_benign(pool)
+    benign_client = pool.select(lambda id, role: id == 0)
+    pool.servers.map(get_clients_weights, benign_client)
+    pool.servers.map(fed_avg)
+    pool.servers.map(set_agreggated_weights_to_server, pool.servers)
     for i in range(10):
+        print(f"Round {i}")
         train_benign(pool)
         train_malicious(pool)
+        pool.servers.map(get_clients_weights, pool.clients)
+        pool.servers.map(fed_avg)
+        pool.servers.map(set_agreggated_weights_to_server, pool.servers)
         extract_fake_image(pool, i)
-    
-    
-    
 
-if __name__ == "__main__":
-    flex_dataset = get_dataset()
-    pool = FlexPool.client_server_pool(fed_dataset=flex_dataset, init_func=build_server_model)
-    run_attack(pool)
-    # writer.flush()
-    # writer.close()
